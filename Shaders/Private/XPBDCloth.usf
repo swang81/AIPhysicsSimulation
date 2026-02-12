@@ -1,0 +1,109 @@
+#include "/Engine/Public/Platform.ush"
+
+[numthreads(64, 1, 1)]
+void PredictPositionsCS(uint3 DTid : SV_DispatchThreadID)
+{
+    uint Id = DTid.x;
+    if (Id >= NumParticles)
+    {
+        return;
+    }
+
+    float4 P = InPosition[Id];
+    float4 V4 = InVelocity[Id];
+    float3 X = P.xyz;
+    float3 V = V4.xyz;
+    float InvMass = P.w;
+
+    if (InvMass > 0.0f)
+    {
+        V += float3(0.0f, 0.0f, GravityZ) * DeltaTime;
+        V *= (1.0f - Damping);
+        X += V * DeltaTime;
+    }
+
+    OutPredicted[Id] = float4(X, InvMass);
+}
+
+[numthreads(64, 1, 1)]
+void SolveDistanceConstraintsCS(uint3 DTid : SV_DispatchThreadID)
+{
+    uint Cid = DTid.x;
+    if (Cid >= NumConstraints)
+    {
+        return;
+    }
+
+    float4 C = Constraints[Cid];
+    uint I = (uint)C.x;
+    uint J = (uint)C.y;
+    float RestLength = C.z;
+
+    float4 Pi4 = Predicted[I];
+    float4 Pj4 = Predicted[J];
+
+    float3 Pi = Pi4.xyz;
+    float3 Pj = Pj4.xyz;
+    float Wi = Pi4.w;
+    float Wj = Pj4.w;
+
+    float3 Delta = Pi - Pj;
+    float Len = length(Delta);
+    if (Len < 1e-6f)
+    {
+        return;
+    }
+
+    float3 N = Delta / Len;
+    float Cx = Len - RestLength;
+
+    float AlphaTilde = Compliance / max(DeltaTime * DeltaTime, 1e-8f);
+    float Denom = Wi + Wj + AlphaTilde;
+    if (Denom < 1e-8f)
+    {
+        return;
+    }
+
+    float OldLambda = Lambda[Cid];
+    float DeltaLambda = (-Cx - AlphaTilde * OldLambda) / Denom;
+    Lambda[Cid] = OldLambda + DeltaLambda;
+
+    // Demo实现：存在并发写风险，生产环境请用graph coloring或Jacobi写回。
+    if (Wi > 0.0f)
+    {
+        Pi += Wi * DeltaLambda * N;
+    }
+    if (Wj > 0.0f)
+    {
+        Pj -= Wj * DeltaLambda * N;
+    }
+
+    Predicted[I] = float4(Pi, Wi);
+    Predicted[J] = float4(Pj, Wj);
+}
+
+[numthreads(64, 1, 1)]
+void UpdateVelocityCS(uint3 DTid : SV_DispatchThreadID)
+{
+    uint Id = DTid.x;
+    if (Id >= NumParticles)
+    {
+        return;
+    }
+
+    float4 OldPos = Position[Id];
+    float4 NewPos = Predicted[Id];
+
+    float InvMass = OldPos.w;
+    float Dt = max(DeltaTime, 1e-8f);
+    float3 V = (NewPos.xyz - OldPos.xyz) / Dt;
+
+    if (InvMass <= 0.0f)
+    {
+        V = 0.0f;
+        NewPos.xyz = OldPos.xyz;
+    }
+
+    Velocity[Id] = float4(V, 0.0f);
+    Position[Id] = float4(NewPos.xyz, InvMass);
+}
